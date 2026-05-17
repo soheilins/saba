@@ -23,87 +23,86 @@ jobs:
         with:
           token: ${{ secrets.MY_GITHUB_TOKEN }}
 
-      - name: Parse source URL
-        id: parse
-        run: |
-          URL="${{ github.event.inputs.source_url }}"
-          if [[ $URL =~ https://github.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*) ]]; then
-            echo "owner=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
-            echo "repo=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
-            echo "branch=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
-            echo "path=${BASH_REMATCH[4]}" >> $GITHUB_OUTPUT
-          else
-            echo "Invalid GitHub directory URL"
-            exit 1
-          fi
-
-      - name: Clone source repository (sparse checkout)
+      - name: Copy files using Python
         env:
           GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
         run: |
-          OWNER="${{ steps.parse.outputs.owner }}"
-          REPO="${{ steps.parse.outputs.repo }}"
-          BRANCH="${{ steps.parse.outputs.branch }}"
-          PATH="${{ steps.parse.outputs.path }}"
-          
-          # Sparse clone: only the needed directory
-          git clone --depth 1 --filter=blob:none --no-checkout \
-            https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPO}.git source_repo
-          cd source_repo
-          git sparse-checkout init --cone
-          git sparse-checkout set "$PATH"
-          git checkout $BRANCH
-          cd ..
-          
-          # List files alphabetically
-          if [ -d "source_repo/$PATH" ]; then
-            ls -1 "source_repo/$PATH" | sort > file_list.txt
-          else
-            echo "Directory not found after checkout"
-            exit 1
-          fi
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import re
+          import urllib.request
+          import json
+          import subprocess
+          import sys
 
-      - name: Select files by range
-        id: select
-        run: |
-          RANGE="${{ github.event.inputs.file_range }}"
-          TOTAL=$(cat file_list.txt | wc -l)
-          if [[ $RANGE =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            START=${BASH_REMATCH[1]}
-            END=${BASH_REMATCH[2]}
-          else
-            echo "Invalid range format. Use e.g., 1-5"
-            exit 1
-          fi
-          if [ $START -lt 1 ] || [ $END -gt $TOTAL ] || [ $START -gt $END ]; then
-            echo "Range $START-$END is invalid (total files: $TOTAL)"
-            exit 1
-          fi
-          SELECTED_FILES=$(cat file_list.txt | sed -n "${START},${END}p")
-          echo "selected_files<<EOF" >> $GITHUB_OUTPUT
-          echo "$SELECTED_FILES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          source_url = os.environ['INPUT_SOURCE_URL']
+          file_range = os.environ['INPUT_FILE_RANGE']
 
-      - name: Copy selected files to target repo and commit
-        run: |
-          PATH="${{ steps.parse.outputs.path }}"
-          SELECTED="${{ steps.select.outputs.selected_files }}"
+          # Parse GitHub URL
+          match = re.match(r'https://github.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*)', source_url)
+          if not match:
+              print("Invalid URL format")
+              sys.exit(1)
+          owner, repo, branch, path = match.groups()
+
+          # Parse range (e.g., "1-5", "3-6")
+          range_match = re.match(r'(\d+)-(\d+)', file_range)
+          if not range_match:
+              print("Invalid range format. Use e.g., 1-5")
+              sys.exit(1)
+          start, end = int(range_match.group(1)), int(range_match.group(2))
+
+          # Get file list from GitHub API
+          api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+          req = urllib.request.Request(api_url)
+          req.add_header('Authorization', f'token {os.environ["GH_TOKEN"]}')
+          req.add_header('User-Agent', 'GitHub-Action')
           
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          try:
+              with urllib.request.urlopen(req) as response:
+                  data = json.loads(response.read().decode())
+          except Exception as e:
+              print(f"Failed to fetch directory: {e}")
+              sys.exit(1)
+
+          files = [item['name'] for item in data if item.get('type') == 'file']
+          files.sort()
+
+          total = len(files)
+          if start < 1 or end > total or start > end:
+              print(f"Range {start}-{end} invalid. Total files: {total}")
+              sys.exit(1)
+
+          selected = files[start-1:end]
+          print(f"Selected {len(selected)} files: {', '.join(selected)}")
+
+          # Download each file
+          for filename in selected:
+              print(f"Downloading: {filename}")
+              file_api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}/{filename}?ref={branch}"
+              req = urllib.request.Request(file_api_url)
+              req.add_header('Authorization', f'token {os.environ["GH_TOKEN"]}')
+              req.add_header('User-Agent', 'GitHub-Action')
+              with urllib.request.urlopen(req) as response:
+                  file_data = json.loads(response.read().decode())
+                  download_url = file_data['download_url']
+                  urllib.request.urlretrieve(download_url, filename)
+
+          # Git operations
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'add', '.'], check=True)
           
-          while IFS= read -r filename; do
-            echo "Copying: $filename"
-            cp "source_repo/$PATH/$filename" .
-          done <<< "$SELECTED"
-          
-          git add .
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            RANGE="${{ github.event.inputs.file_range }}"
-            git commit -m "Copy files $RANGE from ${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.repo }}:$PATH"
-            git push origin HEAD:${{ github.ref_name }}
-          fi
-          
-          rm -rf source_repo
+          # Check if there are changes
+          result = subprocess.run(['git', 'diff', '--cached', '--quiet'], check=False)
+          if result.returncode != 0:
+              commit_msg = f"Copy files {file_range} from {owner}/{repo}:{path}"
+              subprocess.run(['git', 'commit', '-m', commit_msg], check=True)
+              subprocess.run(['git', 'push', 'origin', 'HEAD'], check=True)
+              print("Commit pushed successfully")
+          else:
+              print("No changes to commit")
+          PYTHON_SCRIPT
+        env:
+          INPUT_SOURCE_URL: ${{ github.event.inputs.source_url }}
+          INPUT_FILE_RANGE: ${{ github.event.inputs.file_range }}
