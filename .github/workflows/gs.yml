@@ -1,4 +1,4 @@
-name: Copy Files from Range (No Git)
+name: Copy Files from Range
 
 on:
   workflow_dispatch:
@@ -18,102 +18,94 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Copy and commit files using Python (no git)
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      - name: Copy files using Python
         env:
           GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
           SOURCE_URL: ${{ github.event.inputs.source_url }}
           FILE_RANGE: ${{ github.event.inputs.file_range }}
-          TARGET_REPO: ${{ github.repository }}
-          TARGET_BRANCH: ${{ github.ref_name }}
         run: |
           python3 << 'EOF'
           import os
           import re
           import urllib.request
           import json
-          import base64
+          import subprocess
+          import sys
 
           source_url = os.environ['SOURCE_URL']
           file_range = os.environ['FILE_RANGE']
-          target_repo = os.environ['TARGET_REPO']
-          target_branch = os.environ['TARGET_BRANCH']
-          token = os.environ['GH_TOKEN']
 
-          # Parse source GitHub URL
+          # Parse GitHub URL
           match = re.match(r'https://github.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*)', source_url)
           if not match:
-              raise ValueError("Invalid source URL format")
-          src_owner, src_repo, src_branch, src_path = match.groups()
+              print("Invalid URL format")
+              sys.exit(1)
+          owner, repo, branch, path = match.groups()
 
           # Parse range
           range_match = re.match(r'(\d+)-(\d+)', file_range)
           if not range_match:
-              raise ValueError("Invalid range format. Use e.g., 1-5")
+              print("Invalid range format. Use e.g., 1-5")
+              sys.exit(1)
           start, end = int(range_match.group(1)), int(range_match.group(2))
 
-          # Helper to make API requests
-          def api_request(url, method='GET', data=None):
-              req = urllib.request.Request(url)
-              req.add_header('Authorization', f'token {token}')
-              req.add_header('User-Agent', 'GitHub-Action')
-              if data:
-                  req.add_header('Content-Type', 'application/json')
-                  data_bytes = json.dumps(data).encode()
-                  req.method = method
-                  return urllib.request.urlopen(req, data=data_bytes)
-              else:
-                  req.method = method
-                  return urllib.request.urlopen(req)
+          # Get file list from GitHub API
+          api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+          req = urllib.request.Request(api_url)
+          req.add_header('Authorization', f'token {os.environ["GH_TOKEN"]}')
+          req.add_header('User-Agent', 'GitHub-Action')
+          
+          try:
+              with urllib.request.urlopen(req) as response:
+                  data = json.loads(response.read().decode())
+          except Exception as e:
+              print(f"Failed to fetch directory: {e}")
+              sys.exit(1)
 
-          # Step 1: Get file list from source directory
-          src_api_url = f"https://api.github.com/repos/{src_owner}/{src_repo}/contents/{src_path}?ref={src_branch}"
-          with api_request(src_api_url) as resp:
-              contents = json.loads(resp.read().decode())
-          files = [item['name'] for item in contents if item.get('type') == 'file']
+          files = [item['name'] for item in data if item.get('type') == 'file']
           files.sort()
 
           total = len(files)
           if start < 1 or end > total or start > end:
-              raise ValueError(f"Range {start}-{end} invalid. Total files: {total}")
+              print(f"Range {start}-{end} invalid. Total files: {total}")
+              sys.exit(1)
+
           selected = files[start-1:end]
-          print(f"Selected files: {', '.join(selected)}")
+          print(f"Selected {len(selected)} files: {', '.join(selected)}")
 
-          # Step 2: Download content of each selected file
-          downloaded = []
+          # Create the 'stream' folder if it doesn't exist
+          os.makedirs('stream', exist_ok=True)
+
+          # Download each file into the 'stream' folder
           for filename in selected:
-              file_api_url = f"https://api.github.com/repos/{src_owner}/{src_repo}/contents/{src_path}/{filename}?ref={src_branch}"
-              with api_request(file_api_url) as resp:
-                  file_info = json.loads(resp.read().decode())
-              download_url = file_info['download_url']
-              with urllib.request.urlopen(download_url) as raw:
-                  content = raw.read()
-              downloaded.append((filename, content))
+              print(f"Downloading: {filename}")
+              file_api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}/{filename}?ref={branch}"
+              req = urllib.request.Request(file_api_url)
+              req.add_header('Authorization', f'token {os.environ["GH_TOKEN"]}')
+              req.add_header('User-Agent', 'GitHub-Action')
+              with urllib.request.urlopen(req) as response:
+                  file_data = json.loads(response.read().decode())
+                  download_url = file_data['download_url']
+                  # Save inside the 'stream' folder
+                  urllib.request.urlretrieve(download_url, f"stream/{filename}")
 
-          # Step 3: For each file, create or update in target repo inside "stream" folder
-          for filename, content in downloaded:
-              target_path = f"stream/{filename}"
-              encoded = base64.b64encode(content).decode()
-              target_api_url = f"https://api.github.com/repos/{target_repo}/contents/{target_path}?ref={target_branch}"
-              sha = None
-              try:
-                  with api_request(target_api_url) as resp:
-                      existing = json.loads(resp.read().decode())
-                      sha = existing['sha']
-                  print(f"Updating existing file: {target_path}")
-              except urllib.error.HTTPError as e:
-                  if e.code == 404:
-                      print(f"Creating new file: {target_path}")
-                  else:
-                      raise
-
-              payload = {
-                  'message': f'Copy file {filename} from {src_owner}/{src_repo}:{src_path}',
-                  'content': encoded,
-                  'branch': target_branch
-              }
-              if sha:
-                  payload['sha'] = sha
-
-              with api_request(target_api_url, method='PUT', data=payload) as resp:
-                  print(f"Committed {target_path}")
+          # Git operations
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'add', 'stream'], check=True)   # Add only the stream folder
+          
+          # Check if there are changes
+          result = subprocess.run(['git', 'diff', '--cached', '--quiet'])
+          if result.returncode != 0:
+              commit_msg = f"Copy files {file_range} from {owner}/{repo}:{path}"
+              subprocess.run(['git', 'commit', '-m', commit_msg], check=True)
+              subprocess.run(['git', 'push', 'origin', 'HEAD'], check=True)
+              print("Commit pushed successfully")
+          else:
+              print("No changes to commit")
           EOF
