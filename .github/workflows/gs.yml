@@ -26,8 +26,10 @@ jobs:
       - name: Copy files using Python
         env:
           GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+          SOURCE_URL: ${{ github.event.inputs.source_url }}
+          FILE_RANGE: ${{ github.event.inputs.file_range }}
         run: |
-          python3 << 'PYTHON_SCRIPT'
+          python3 << 'EOF'
           import os
           import re
           import urllib.request
@@ -35,8 +37,8 @@ jobs:
           import subprocess
           import sys
 
-          source_url = os.environ['INPUT_SOURCE_URL']
-          file_range = os.environ['INPUT_FILE_RANGE']
+          source_url = os.environ['SOURCE_URL']
+          file_range = os.environ['FILE_RANGE']
 
           # Parse GitHub URL
           match = re.match(r'https://github.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*)', source_url)
@@ -45,7 +47,7 @@ jobs:
               sys.exit(1)
           owner, repo, branch, path = match.groups()
 
-          # Parse range (e.g., "1-5", "3-6")
+          # Parse range
           range_match = re.match(r'(\d+)-(\d+)', file_range)
           if not range_match:
               print("Invalid range format. Use e.g., 1-5")
@@ -94,7 +96,7 @@ jobs:
           subprocess.run(['git', 'add', '.'], check=True)
           
           # Check if there are changes
-          result = subprocess.run(['git', 'diff', '--cached', '--quiet'], check=False)
+          result = subprocess.run(['git', 'diff', '--cached', '--quiet'])
           if result.returncode != 0:
               commit_msg = f"Copy files {file_range} from {owner}/{repo}:{path}"
               subprocess.run(['git', 'commit', '-m', commit_msg], check=True)
@@ -102,7 +104,4 @@ jobs:
               print("Commit pushed successfully")
           else:
               print("No changes to commit")
-          PYTHON_SCRIPT
-        env:
-          INPUT_SOURCE_URL: ${{ github.event.inputs.source_url }}
-          INPUT_FILE_RANGE: ${{ github.event.inputs.file_range }}
+          EOF
