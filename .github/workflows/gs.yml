@@ -37,8 +37,7 @@ jobs:
             exit 1
           fi
 
-      - name: Get file list from source directory using gh
-        id: files
+      - name: Clone source repository (sparse checkout)
         env:
           GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
         run: |
@@ -46,26 +45,29 @@ jobs:
           REPO="${{ steps.parse.outputs.repo }}"
           BRANCH="${{ steps.parse.outputs.branch }}"
           PATH="${{ steps.parse.outputs.path }}"
-
-          # Use gh api to get directory contents
-          RESPONSE=$(gh api "repos/${OWNER}/${REPO}/contents/${PATH}?ref=${BRANCH}")
           
-          # Filter only files, sort by name
-          FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' | sort)
-          if [ -z "$FILES" ]; then
-            echo "No files found in the source directory."
+          # Sparse clone: only the needed directory
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPO}.git source_repo
+          cd source_repo
+          git sparse-checkout init --cone
+          git sparse-checkout set "$PATH"
+          git checkout $BRANCH
+          cd ..
+          
+          # List files alphabetically
+          if [ -d "source_repo/$PATH" ]; then
+            ls -1 "source_repo/$PATH" | sort > file_list.txt
+          else
+            echo "Directory not found after checkout"
             exit 1
           fi
-          
-          echo "$FILES" > file_list.txt
-          echo "file_count=$(echo "$FILES" | wc -l)" >> $GITHUB_OUTPUT
 
       - name: Select files by range
         id: select
         run: |
           RANGE="${{ github.event.inputs.file_range }}"
           TOTAL=$(cat file_list.txt | wc -l)
-
           if [[ $RANGE =~ ^([0-9]+)-([0-9]+)$ ]]; then
             START=${BASH_REMATCH[1]}
             END=${BASH_REMATCH[2]}
@@ -73,52 +75,35 @@ jobs:
             echo "Invalid range format. Use e.g., 1-5"
             exit 1
           fi
-
           if [ $START -lt 1 ] || [ $END -gt $TOTAL ] || [ $START -gt $END ]; then
             echo "Range $START-$END is invalid (total files: $TOTAL)"
             exit 1
           fi
-
           SELECTED_FILES=$(cat file_list.txt | sed -n "${START},${END}p")
-          if [ -z "$SELECTED_FILES" ]; then
-            echo "No files selected in range."
-            exit 1
-          fi
-
           echo "selected_files<<EOF" >> $GITHUB_OUTPUT
           echo "$SELECTED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Download and commit selected files
-        env:
-          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+      - name: Copy selected files to target repo and commit
         run: |
-          OWNER="${{ steps.parse.outputs.owner }}"
-          REPO="${{ steps.parse.outputs.repo }}"
-          BRANCH="${{ steps.parse.outputs.branch }}"
           PATH="${{ steps.parse.outputs.path }}"
           SELECTED="${{ steps.select.outputs.selected_files }}"
-
+          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
+          
           while IFS= read -r filename; do
-            echo "Downloading: $filename"
-            # Get the download URL via gh API
-            DOWNLOAD_URL=$(gh api "repos/${OWNER}/${REPO}/contents/${PATH}/${filename}?ref=${BRANCH}" --jq '.download_url')
-            if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-              echo "Failed to get download URL for $filename"
-              exit 1
-            fi
-            # Use wget (available on runner) or gh release download, but wget is fine
-            wget -q -O "$filename" "$DOWNLOAD_URL"
+            echo "Copying: $filename"
+            cp "source_repo/$PATH/$filename" .
           done <<< "$SELECTED"
-
+          
           git add .
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
             RANGE="${{ github.event.inputs.file_range }}"
-            git commit -m "Copy files $RANGE from $OWNER/$REPO:$PATH"
+            git commit -m "Copy files $RANGE from ${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.repo }}:$PATH"
             git push origin HEAD:${{ github.ref_name }}
           fi
+          
+          rm -rf source_repo
