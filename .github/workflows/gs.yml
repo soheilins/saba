@@ -1,0 +1,140 @@
+name: Copy Files from Range
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'GitHub directory link (e.g., https://github.com/owner/repo/tree/branch/path)'
+        required: true
+        type: string
+      file_range:
+        description: 'Range of files to copy (e.g., 1-5, 3-6)'
+        required: true
+        type: string
+
+jobs:
+  copy-files:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      - name: Parse source URL
+        id: parse
+        run: |
+          URL="${{ github.event.inputs.source_url }}"
+          # Extract owner, repo, branch, path from URLs like:
+          # https://github.com/owner/repo/tree/branch/path
+          if [[ $URL =~ https://github.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*) ]]; then
+            echo "owner=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "repo=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+            echo "branch=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
+            echo "path=${BASH_REMATCH[4]}" >> $GITHUB_OUTPUT
+          else
+            echo "Invalid GitHub directory URL"
+            exit 1
+          fi
+
+      - name: Get file list from source directory
+        id: files
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+        run: |
+          OWNER="${{ steps.parse.outputs.owner }}"
+          REPO="${{ steps.parse.outputs.repo }}"
+          BRANCH="${{ steps.parse.outputs.branch }}"
+          PATH="${{ steps.parse.outputs.path }}"
+
+          # Fetch directory contents via API
+          API_URL="https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}?ref=${BRANCH}"
+          RESPONSE=$(curl -s -H "Authorization: token $GH_TOKEN" "$API_URL")
+
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.message' > /dev/null; then
+            echo "API error: $(echo "$RESPONSE" | jq -r '.message')"
+            exit 1
+          fi
+
+          # Filter only files (type 'file'), sort by name
+          FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' | sort)
+          if [ -z "$FILES" ]; then
+            echo "No files found in the source directory."
+            exit 1
+          fi
+
+          # Save list to file for later steps
+          echo "$FILES" > file_list.txt
+          echo "file_count=$(echo "$FILES" | wc -l)" >> $GITHUB_OUTPUT
+
+      - name: Select files by range
+        id: select
+        run: |
+          RANGE="${{ github.event.inputs.file_range }}"
+          TOTAL=$(cat file_list.txt | wc -l)
+
+          # Parse range e.g., "1-5" or "3-6"
+          if [[ $RANGE =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            START=${BASH_REMATCH[1]}
+            END=${BASH_REMATCH[2]}
+          else
+            echo "Invalid range format. Use e.g., 1-5"
+            exit 1
+          fi
+
+          # Validate indices (1‑based)
+          if [ $START -lt 1 ] || [ $END -gt $TOTAL ] || [ $START -gt $END ]; then
+            echo "Range $START-$END is invalid (total files: $TOTAL)"
+            exit 1
+          fi
+
+          # Extract selected file names
+          SELECTED_FILES=$(cat file_list.txt | sed -n "${START},${END}p")
+          if [ -z "$SELECTED_FILES" ]; then
+            echo "No files selected in range."
+            exit 1
+          fi
+
+          echo "selected_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$SELECTED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Download and commit selected files
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+        run: |
+          OWNER="${{ steps.parse.outputs.owner }}"
+          REPO="${{ steps.parse.outputs.repo }}"
+          BRANCH="${{ steps.parse.outputs.branch }}"
+          PATH="${{ steps.parse.outputs.path }}"
+          SELECTED="${{ steps.select.outputs.selected_files }}"
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Download each selected file
+          while IFS= read -r filename; do
+            echo "Downloading: $filename"
+            # Get download_url from API for each file
+            API_URL="https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}/${filename}?ref=${BRANCH}"
+            DOWNLOAD_URL=$(curl -s -H "Authorization: token $GH_TOKEN" "$API_URL" | jq -r '.download_url')
+            if [ "$DOWNLOAD_URL" = "null" ] || [ -z "$DOWNLOAD_URL" ]; then
+              echo "Failed to get download URL for $filename"
+              exit 1
+            fi
+            curl -s -L -o "$filename" "$DOWNLOAD_URL"
+          done <<< "$SELECTED"
+
+          # Add and commit if there are changes
+          git add .
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            RANGE="${{ github.event.inputs.file_range }}"
+            git commit -m "Copy files $RANGE from ${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.path }}"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
